@@ -1,0 +1,10 @@
+[package]
+name = "panopticon-m365"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serdepanopticon-core = "0.1.0"
+uuid = { version = "1.20", features = ["serde", "v8"] }
+anyhow = "1.0.100"
+serde = { version = "1.0", features = ["derive"] }
