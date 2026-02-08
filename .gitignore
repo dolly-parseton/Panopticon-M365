@@ -1,1 +1,3 @@
 /target
+
+./src/client/auth.rs

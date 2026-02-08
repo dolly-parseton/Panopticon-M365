@@ -1,3 +1,8 @@
+pub mod common;
+pub mod log_analytics;
+pub mod resource_manager;
+pub mod sentinel;
+
 use panopticon_core::extend::Result;
 use uuid::Uuid;
 
@@ -46,9 +51,8 @@ pub enum ResourceId {
 
 pub struct ProviderNamespace(String, String);
 
-impl<T: Into<String>> TryFrom<T> for ProviderNamespace {
-    type Error = anyhow::Error;
-    fn try_from(value: T) -> Result<Self> {
+impl ProviderNamespace {
+    pub fn try_from<T: Into<String>>(value: T) -> Result<Self> {
         /*
             As far as I can tell it's just a prefix.suffix format with alphanumerics and a dot between. (Microsoft.Compute, Microsoft.Security, etc.)
         */
@@ -72,12 +76,12 @@ impl<T: Into<String>> TryFrom<T> for ProviderNamespace {
         ))
     }
 }
-pub struct ResourceGroup(String);
+pub struct ResourceGroup {
+    name: String,
+}
 
-impl<T: Into<String>> TryFrom<T> for ResourceGroup {
-    type Error = anyhow::Error;
-
-    fn try_from(value: T) -> Result<Self> {
+impl ResourceGroup {
+    pub fn try_from<T: Into<String>>(value: T) -> Result<Self> {
         /*
             As far as I can tell there's only a few rules:
             * 1 to 90 characters
@@ -104,6 +108,6 @@ impl<T: Into<String>> TryFrom<T> for ResourceGroup {
                 "Resource Group name contains invalid characters"
             ));
         }
-        Ok(ResourceGroup(s))
+        Ok(ResourceGroup { name: s })
     }
 }

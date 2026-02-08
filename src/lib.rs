@@ -7,6 +7,9 @@
     * Command Types with the panopticon-core trait implementations, allowing for execution in panopticon_core::prelude::Pipeline.
 */
 
+// temp allow unsueds until more is implemented
+#![allow(unused)]
+
 mod apis; // Contains API request/response types and logic for various M365 related APIs.
 mod client; // Contains the HTTP client type that handles auth, requests, responses, etc.
 mod commands; // Contains command types that implement panopticon_core::prelude::Command for use in pipelines.
