@@ -4,4 +4,5 @@
 */
 
 pub mod common;
+pub mod log_analytics;
 pub mod sentinel;

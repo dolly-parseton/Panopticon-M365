@@ -1,3 +1,9 @@
 pub mod create_update;
+pub mod delete;
 pub mod get;
+pub mod list;
+pub mod list_alerts;
+pub mod list_bookmarks;
+pub mod list_entities;
+pub mod run_playbook;
 pub mod types;

@@ -8,6 +8,9 @@ pub struct Target {
 }
 
 impl Target {
+    /// Sentinel API version constant
+    pub const API_VERSION: &'static str = "2025-09-01";
+
     /// Parses a target from a resource ID pattern string:
     /// /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.OperationalInsights/workspaces/{workspaceName}/
     pub fn parse(s: &str) -> anyhow::Result<Self> {
@@ -45,6 +48,37 @@ impl Target {
 
     pub fn workspace_name(&self) -> &str {
         &self.workspace_name
+    }
+
+    /// Base Sentinel API URL for this workspace
+    pub fn sentinel_base_url(&self) -> String {
+        format!(
+            "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.OperationalInsights/workspaces/{}/providers/Microsoft.SecurityInsights",
+            self.subscription_id,
+            self.resource_group,
+            self.workspace_name
+        )
+    }
+
+    /// Build URL for a resource type with optional ID.
+    /// Resource should be singular form (e.g., "incident", "watchlist").
+    pub fn resource_url(&self, resource: &str, id: Option<&str>) -> String {
+        let base = self.sentinel_base_url();
+        match id {
+            Some(id) => format!("{}/{}s/{}?api-version={}", base, resource, id, Self::API_VERSION),
+            None => format!("{}/{}s?api-version={}", base, resource, Self::API_VERSION),
+        }
+    }
+
+    /// Build URL for incident sub-resources (alerts, bookmarks, entities, comments).
+    pub fn incident_sub_resource_url(&self, incident_id: &str, sub_resource: &str) -> String {
+        format!(
+            "{}/incidents/{}/{}?api-version={}",
+            self.sentinel_base_url(),
+            incident_id,
+            sub_resource,
+            Self::API_VERSION
+        )
     }
 }
 

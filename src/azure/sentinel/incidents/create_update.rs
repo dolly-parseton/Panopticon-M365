@@ -1,7 +1,10 @@
 use super::types::*;
-use crate::auth::{AuthScope, SessionStore};
+use crate::azure::common::{
+    check_response_success, client_id_attribute, get_azure_management_token,
+    incident_id_attribute, sentinel_target_attribute, tenant_id_attribute,
+};
 use crate::azure::sentinel::Target;
-use oauth2::reqwest;
+use crate::impl_descriptor;
 use panopticon_core::extend::*;
 use panopticon_core::prelude::*;
 
@@ -9,32 +12,10 @@ use panopticon_core::prelude::*;
 
 static CREATE_INCIDENT_SPEC: CommandSchema = LazyLock::new(|| {
     CommandSpecBuilder::new()
-        // Auth attributes (must match a session initialized by M365AuthCommand)
-        .attribute(
-            AttributeSpecBuilder::new("client_id", TypeDef::Scalar(ScalarType::String))
-                .required()
-                .hint("Azure AD App Registration Client ID (must match M365AuthCommand session)")
-                .build(),
-        )
-        .attribute(
-            AttributeSpecBuilder::new("tenant_id", TypeDef::Scalar(ScalarType::String))
-                .required()
-                .hint("Azure AD Tenant ID (must match M365AuthCommand session)")
-                .build(),
-        )
-        // Required attributes
-        .attribute(
-            AttributeSpecBuilder::new("target", TypeDef::Scalar(ScalarType::String))
-                .required()
-                .hint("Resource ID path: /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.OperationalInsights/workspaces/{workspaceName}/")
-                .build(),
-        )
-        .attribute(
-            AttributeSpecBuilder::new("incident_id", TypeDef::Scalar(ScalarType::String))
-                .required()
-                .hint("Incident ID (GUID format)")
-                .build(),
-        )
+        .attribute(client_id_attribute())
+        .attribute(tenant_id_attribute())
+        .attribute(sentinel_target_attribute())
+        .attribute(incident_id_attribute())
         .attribute(
             AttributeSpecBuilder::new("title", TypeDef::Scalar(ScalarType::String))
                 .required()
@@ -142,17 +123,7 @@ pub struct CreateIncidentCommand {
 
 // ─── Step 3: Implement Descriptor ───────────────────────────────────────────
 
-impl Descriptor for CreateIncidentCommand {
-    fn command_type() -> &'static str {
-        "CreateIncidentCommand"
-    }
-    fn command_attributes() -> &'static [AttributeSpec<&'static str>] {
-        &CREATE_INCIDENT_SPEC.0
-    }
-    fn command_results() -> &'static [ResultSpec<&'static str>] {
-        &CREATE_INCIDENT_SPEC.1
-    }
-}
+impl_descriptor!(CreateIncidentCommand, "CreateIncidentCommand", CREATE_INCIDENT_SPEC);
 
 // ─── Step 4: Implement FromAttributes ───────────────────────────────────────
 
@@ -218,47 +189,12 @@ impl FromAttributes for CreateIncidentCommand {
 #[async_trait]
 impl Executable for CreateIncidentCommand {
     async fn execute(&self, context: &ExecutionContext, output_prefix: &StorePath) -> Result<()> {
-        // Get HTTP client from context extensions
-        let http: reqwest::Client = {
-            let ext = context.extensions().read().await;
-            ext.get::<reqwest::Client>()
-                .ok_or_else(|| anyhow::anyhow!("HTTP client not found. Run M365AuthCommand first."))?
-                .clone()
-        };
+        let (http, token) =
+            get_azure_management_token(context, &self.client_id, &self.tenant_id).await?;
 
-        // Build auth scope for Azure Management API
-        let scope = AuthScope {
-            client_id: self.client_id.clone(),
-            tenant_id: self.tenant_id.clone(),
-            scopes: vec!["https://management.azure.com/.default".to_string()],
-        };
-
-        // Get token from SessionStore
-        let services = context.services();
-        let token = {
-            let mut ext = context.extensions().write().await;
-            let store = ext
-                .get_mut::<SessionStore>()
-                .ok_or_else(|| anyhow::anyhow!("SessionStore not found. Run M365AuthCommand first."))?;
-            store
-                .get_secret(&scope, &http, &services)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("Failed to get auth token for Azure Management API"))?
-        };
-
-        // Build the request body
         let request_body = self.build_request_body();
+        let url = self.target.resource_url("incident", Some(&self.incident_id));
 
-        // Build the API URL
-        let url = format!(
-            "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.OperationalInsights/workspaces/{}/providers/Microsoft.SecurityInsights/incidents/{}?api-version=2025-09-01",
-            self.target.subscription_id(),
-            self.target.resource_group(),
-            self.target.workspace_name(),
-            self.incident_id
-        );
-
-        // Make the PUT request
         let response = http
             .put(&url)
             .header("Authorization", format!("Bearer {}", token))
@@ -267,17 +203,7 @@ impl Executable for CreateIncidentCommand {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "Failed to create/update incident: {} - {}",
-                status,
-                body
-            ));
-        }
-
-        // Parse the response
+        let response = check_response_success(response, "create/update incident").await?;
         let incident: Incident = response.json().await?;
 
         // Write results

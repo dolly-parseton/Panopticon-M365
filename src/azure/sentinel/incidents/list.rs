@@ -1,7 +1,7 @@
 use super::types::*;
 use crate::azure::common::{
     check_response_success, client_id_attribute, get_azure_management_token,
-    incident_id_attribute, sentinel_target_attribute, tenant_id_attribute,
+    sentinel_target_attribute, tenant_id_attribute,
 };
 use crate::azure::sentinel::Target;
 use crate::impl_descriptor;
@@ -10,12 +10,26 @@ use panopticon_core::prelude::*;
 
 // ─── Step 1: Define the CommandSchema ───────────────────────────────────────
 
-static GET_INCIDENT_SPEC: CommandSchema = LazyLock::new(|| {
+static LIST_INCIDENTS_SPEC: CommandSchema = LazyLock::new(|| {
     CommandSpecBuilder::new()
         .attribute(client_id_attribute())
         .attribute(tenant_id_attribute())
         .attribute(sentinel_target_attribute())
-        .attribute(incident_id_attribute())
+        .attribute(
+            AttributeSpecBuilder::new("filter", TypeDef::Scalar(ScalarType::String))
+                .hint("OData filter expression (e.g., \"properties/status eq 'New'\")")
+                .build(),
+        )
+        .attribute(
+            AttributeSpecBuilder::new("orderby", TypeDef::Scalar(ScalarType::String))
+                .hint("OData orderby expression (e.g., \"properties/createdTimeUtc desc\")")
+                .build(),
+        )
+        .attribute(
+            AttributeSpecBuilder::new("top", TypeDef::Scalar(ScalarType::Number))
+                .hint("Maximum number of incidents to return")
+                .build(),
+        )
         // Results - Core identifiers
         .fixed_result(
             "id",
@@ -113,7 +127,7 @@ static GET_INCIDENT_SPEC: CommandSchema = LazyLock::new(|| {
         .fixed_result(
             "classification_reason",
             TypeDef::Scalar(ScalarType::String),
-            Some("Classification reason: SuspiciousActivity, SuspiciousButExpected, IncorrectAlertLogic, or InaccurateData"),
+            Some("Classification reason"),
             ResultKind::Data,
         )
         // Results - Owner information
@@ -133,12 +147,6 @@ static GET_INCIDENT_SPEC: CommandSchema = LazyLock::new(|| {
             "owner_assigned_to",
             TypeDef::Scalar(ScalarType::String),
             Some("Display name of the incident owner"),
-            ResultKind::Data,
-        )
-        .fixed_result(
-            "owner_user_principal_name",
-            TypeDef::Scalar(ScalarType::String),
-            Some("User principal name of the incident owner"),
             ResultKind::Data,
         )
         // Results - Additional data
@@ -166,33 +174,27 @@ static GET_INCIDENT_SPEC: CommandSchema = LazyLock::new(|| {
             Some("The name of the source provider that generated the incident"),
             ResultKind::Data,
         )
-        .fixed_result(
-            "provider_incident_id",
-            TypeDef::Scalar(ScalarType::String),
-            Some("The incident ID assigned by the provider"),
-            ResultKind::Data,
-        )
         .build()
 });
 
 // ─── Step 2: Define the command struct ──────────────────────────────────────
 
-pub struct GetIncidentCommand {
-    // Auth
+pub struct ListIncidentsCommand {
     pub client_id: String,
     pub tenant_id: String,
-    // Target
     pub target: Target,
-    pub incident_id: String,
+    pub filter: Option<String>,
+    pub orderby: Option<String>,
+    pub top: Option<i64>,
 }
 
 // ─── Step 3: Implement Descriptor ───────────────────────────────────────────
 
-impl_descriptor!(GetIncidentCommand, "GetIncidentCommand", GET_INCIDENT_SPEC);
+impl_descriptor!(ListIncidentsCommand, "ListIncidentsCommand", LIST_INCIDENTS_SPEC);
 
 // ─── Step 4: Implement FromAttributes ───────────────────────────────────────
 
-impl FromAttributes for GetIncidentCommand {
+impl FromAttributes for ListIncidentsCommand {
     fn from_attributes(attrs: &Attributes) -> Result<Self> {
         let client_id = attrs.get_required_string("client_id")?;
         let tenant_id = attrs.get_required_string("tenant_id")?;
@@ -201,13 +203,17 @@ impl FromAttributes for GetIncidentCommand {
         let target = Target::try_from(target_str.as_str())
             .map_err(|e| anyhow::anyhow!("Invalid target: {}", e))?;
 
-        let incident_id = attrs.get_required_string("incident_id")?;
+        let filter = attrs.get_optional_string("filter");
+        let orderby = attrs.get_optional_string("orderby");
+        let top = attrs.get_optional_i64("top");
 
-        Ok(GetIncidentCommand {
+        Ok(ListIncidentsCommand {
             client_id,
             tenant_id,
             target,
-            incident_id,
+            filter,
+            orderby,
+            top,
         })
     }
 }
@@ -215,25 +221,57 @@ impl FromAttributes for GetIncidentCommand {
 // ─── Step 5: Implement Executable ───────────────────────────────────────────
 
 #[async_trait]
-impl Executable for GetIncidentCommand {
+impl Executable for ListIncidentsCommand {
     async fn execute(&self, context: &ExecutionContext, output_prefix: &StorePath) -> Result<()> {
         let (http, token) =
             get_azure_management_token(context, &self.client_id, &self.tenant_id).await?;
 
-        let url = self.target.resource_url("incident", Some(&self.incident_id));
+        let mut url = self.target.resource_url("incident", None);
 
-        let response = http
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await?;
+        // Add optional query parameters (values should be URL-encoded by the caller if needed)
+        if let Some(filter) = &self.filter {
+            url.push_str(&format!("&$filter={}", filter));
+        }
+        if let Some(orderby) = &self.orderby {
+            url.push_str(&format!("&$orderby={}", orderby));
+        }
+        if let Some(top) = self.top {
+            url.push_str(&format!("&$top={}", top));
+        }
 
-        let response = check_response_success(response, "get incident").await?;
-        let incident: Incident = response.json().await?;
+        let mut row_index: usize = 0;
 
-        // Write results
-        let out = InsertBatch::new(context, output_prefix);
+        loop {
+            let response = http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await?;
 
+            let response = check_response_success(response, "list incidents").await?;
+            let list: IncidentList = response.json().await?;
+
+            if let Some(incidents) = list.value {
+                for (i, incident) in incidents.iter().enumerate() {
+                    let path = output_prefix.with_index(row_index + i);
+                    let out = InsertBatch::new(context, &path);
+                    Self::write_incident(&out, incident).await?;
+                }
+                row_index += incidents.len();
+            }
+
+            match list.next_link {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ListIncidentsCommand {
+    async fn write_incident(out: &InsertBatch<'_>, incident: &Incident) -> Result<()> {
         // Core identifiers
         if let Some(id) = &incident.id {
             out.string("id", id.clone()).await?;
@@ -247,12 +285,10 @@ impl Executable for GetIncidentCommand {
 
         // Properties
         if let Some(props) = &incident.properties {
-            // Required properties
             out.string("title", props.title.clone()).await?;
             out.string("severity", format!("{:?}", props.severity)).await?;
             out.string("status", format!("{:?}", props.status)).await?;
 
-            // Read-only properties
             if let Some(number) = props.incident_number {
                 out.i64("incident_number", number as i64).await?;
             }
@@ -265,8 +301,6 @@ impl Executable for GetIncidentCommand {
             if let Some(modified) = &props.last_modified_time_utc {
                 out.string("last_modified_time_utc", modified.clone()).await?;
             }
-
-            // Optional properties
             if let Some(desc) = &props.description {
                 out.string("description", desc.clone()).await?;
             }
@@ -297,9 +331,6 @@ impl Executable for GetIncidentCommand {
                 if let Some(assigned_to) = &owner.assigned_to {
                     out.string("owner_assigned_to", assigned_to.clone()).await?;
                 }
-                if let Some(upn) = &owner.user_principal_name {
-                    out.string("owner_user_principal_name", upn.clone()).await?;
-                }
             }
 
             // Additional data
@@ -315,12 +346,8 @@ impl Executable for GetIncidentCommand {
                 }
             }
 
-            // Provider info
             if let Some(provider) = &props.provider_name {
                 out.string("provider_name", provider.clone()).await?;
-            }
-            if let Some(provider_id) = &props.provider_incident_id {
-                out.string("provider_incident_id", provider_id.clone()).await?;
             }
         }
 
