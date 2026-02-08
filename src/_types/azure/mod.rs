@@ -76,6 +76,7 @@ impl ProviderNamespace {
         ))
     }
 }
+
 pub struct ResourceGroup {
     name: String,
 }

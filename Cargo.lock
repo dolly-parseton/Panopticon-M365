@@ -571,6 +571,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1492,9 +1498,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "panopticon-core"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48b8b069d350445d5da87218086b17535e0811a34c6dde957bad13bd110b99be"
+checksum = "07178c3b5cd16ae2efed6f386add89fb3aa7f3a893fa5812652159f7ecbd712d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1516,6 +1522,7 @@ name = "panopticon-m365"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dotenvy",
  "oauth2",
  "panopticon-core",
  "serde",

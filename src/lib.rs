@@ -10,10 +10,12 @@
 // temp allow unsueds until more is implemented
 #![allow(unused)]
 
-mod apis; // Contains API request/response types and logic for various M365 related APIs.
-mod client; // Contains the HTTP client type that handles auth, requests, responses, etc.
+// mod apis; // Contains API request/response types and logic for various M365 related APIs.
+// mod client; // Contains the HTTP client type that handles auth, requests, responses, etc.
 mod commands; // Contains command types that implement panopticon_core::prelude::Command for use in pipelines.
-mod types; // Contains utility types used across the library.
+// mod types; // Contains utility types used across the library.
+mod auth; // Contains authentication logic and store type, acts as an extension, no formal client type needed.
+mod azure; // Contains types related to Azure resources, APIs, etc.
 
 /*
     TODO:

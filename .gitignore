@@ -1,3 +1,4 @@
 /target
+.env
 
 ./src/client/auth.rs
