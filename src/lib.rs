@@ -7,16 +7,13 @@
     * Command Types with the panopticon-core trait implementations, allowing for execution in panopticon_core::prelude::Pipeline.
 */
 
-// temp allow unsueds until more is implemented
 #![allow(unused)]
 
-// mod apis; // Contains API request/response types and logic for various M365 related APIs.
-// mod client; // Contains the HTTP client type that handles auth, requests, responses, etc.
-mod commands; // Contains command types that implement panopticon_core::prelude::Command for use in pipelines.
-// mod types; // Contains utility types used across the library.
-mod auth; // Contains authentication logic and store type, acts as an extension, no formal client type needed.
-mod azure; // Contains types related to Azure resources, APIs, etc.
-
+pub mod auth;
+pub mod azure;
+pub mod endpoint;
+pub mod operations;
+pub mod resource;
 /*
     TODO:
     1. First sort the client and the interface used to make requests.

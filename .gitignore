@@ -1,4 +1,5 @@
 /target
 .env
 
-./src/client/auth.rs
+./src/client/auth.rspanopticon-lib-src
+panopticon-lib-examples

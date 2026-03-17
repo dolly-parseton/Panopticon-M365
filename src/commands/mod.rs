@@ -1,1 +1,0 @@
-pub mod m365_auth; // A command that initialises serveral extensions on the execution context that enable authentication and token retrieval for M365 API requests, including a SessionStore extension that manages authenticated sessions for different scopes and provides tokens to other commands when needed.  
