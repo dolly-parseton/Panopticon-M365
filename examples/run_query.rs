@@ -1,7 +1,7 @@
-//! Example: Run a KQL datatable query and deserialize results into concrete structs.
+//! Example: Run KQL queries against both Sentinel (Log Analytics) and Defender XDR (Advanced Hunting).
 //!
-//! Requires env vars: TEST_CLIENT_ID, TEST_TENANT_ID, TEST_WORKSPACE_ID, TEST_ARM_PATH
-//! (or a .env file in the project root).
+//! Requires env vars: TEST_CLIENT_ID, TEST_TENANT_ID, TEST_WORKSPACE_ID, TEST_ARM_PATH,
+//! TEST_SUBSCRIPTION_ID, TEST_RESOURCE_GROUP (or a .env file in the project root).
 //!
 //! Run with:
 //!   cargo run --example run_query
@@ -9,7 +9,8 @@
 use panopticon_core::prelude::*;
 use panopticon_m365::auth::{AZURE_LOG_ANALYTICS_SCOPE, AuthScope, M365_AUTH_EXT, M365Auth};
 use panopticon_m365::azure::log_analytics::{LogAnalyticsWorkspace, QueryResponse};
-use panopticon_m365::operations::RunQuery;
+use panopticon_m365::defender::advanced_hunting::{DefenderXdr, HuntingResponse};
+use panopticon_m365::operations::{RunHuntingQuery, RunSentinelQuery};
 use panopticon_m365::resource::ResourceMap;
 use serde::Deserialize;
 
@@ -31,7 +32,7 @@ struct SignInEvent {
     risk_level: String,
 }
 
-/// The shape of the RunQuery pipeline returns, used with `deserialize_returns`.
+/// The shape of pipeline returns for both operations.
 #[derive(Debug, Deserialize)]
 struct QueryOutput {
     result: String,
@@ -56,6 +57,24 @@ datatable(
 ]
 "#;
 
+/// Defender XDR Advanced Hunting datatable query — simulates device network events.
+const HUNTING_QUERY: &str = r#"
+datatable(
+    Timestamp: datetime,
+    DeviceName: string,
+    RemoteIP: string,
+    RemotePort: int,
+    ActionType: string,
+    ConnectionCount: long
+) [
+    datetime(2026-03-17T10:01:00Z), "DESKTOP-SOC01",  "198.51.100.10", 443,  "ConnectionSuccess", 42,
+    datetime(2026-03-17T10:02:00Z), "DESKTOP-SOC01",  "203.0.113.55",  8080, "ConnectionSuccess", 15,
+    datetime(2026-03-17T10:03:00Z), "SERVER-DC01",     "192.0.2.1",     53,   "ConnectionSuccess", 128,
+    datetime(2026-03-17T10:04:00Z), "LAPTOP-IR02",     "198.51.100.77", 22,   "ConnectionSuccess", 3,
+    datetime(2026-03-17T10:05:00Z), "SERVER-WEB03",    "203.0.113.200", 443,  "ConnectionBlocked", 87
+]
+"#;
+
 fn load_env() -> (String, String, String, String, String, String) {
     dotenvy::dotenv().ok();
     let client_id = std::env::var("TEST_CLIENT_ID").expect("TEST_CLIENT_ID required");
@@ -76,26 +95,12 @@ fn load_env() -> (String, String, String, String, String, String) {
     )
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let (client_id, tenant_id, workspace_id, arm_path, subscription_id, resource_group) =
-        load_env();
-
-    // ── 1. Authenticate (consumer responsibility, before pipeline) ──────────
-    let http = oauth2::reqwest::Client::new();
-    let runtime = tokio::runtime::Handle::current();
-    let auth = M365Auth::new(http, runtime);
-
-    let scope = AuthScope {
-        client_id: client_id.clone(),
-        tenant_id: tenant_id.clone(),
-        scopes: vec![
-            "offline_access".to_string(),
-            AZURE_LOG_ANALYTICS_SCOPE.to_string(),
-        ],
-    };
-
-    println!("Starting device code authentication...");
+/// Run the device code flow for a given scope, printing prompts to stdout.
+async fn authenticate(auth: &M365Auth, scope: AuthScope) -> anyhow::Result<()> {
+    println!(
+        "Authenticating for scope: {} ...",
+        scope.scopes.last().unwrap_or(&"?".to_string())
+    );
     let mut rx = auth.authenticate(scope);
     while let Some(event) = rx.recv().await {
         match event {
@@ -106,15 +111,43 @@ async fn main() -> anyhow::Result<()> {
             panopticon_m365::auth::AuthEvent::Polling => print!("."),
             panopticon_m365::auth::AuthEvent::Authenticated => {
                 println!("\nAuthenticated!");
-                break;
+                return Ok(());
             }
             panopticon_m365::auth::AuthEvent::Error(e) => {
                 anyhow::bail!("Authentication failed: {}", e);
             }
         }
     }
+    anyhow::bail!("Authentication channel closed unexpectedly")
+}
 
-    // ── 2. Build resource map ───────────────────────────────────────────────
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let (client_id, tenant_id, workspace_id, arm_path, subscription_id, resource_group) =
+        load_env();
+
+    // ── 1. Authenticate ────────────────────────────────────────────────────────
+    // One interactive device code flow per (client_id, tenant_id) pair.
+    // The refresh token is then used to silently acquire tokens for any
+    // additional resource scopes (e.g. Graph API) — no extra user interaction.
+    let http = oauth2::reqwest::Client::new();
+    let runtime = tokio::runtime::Handle::current();
+    let auth = M365Auth::new(http, runtime);
+
+    authenticate(
+        &auth,
+        AuthScope {
+            client_id: client_id.clone(),
+            tenant_id: tenant_id.clone(),
+            scopes: vec![
+                "offline_access".to_string(),
+                AZURE_LOG_ANALYTICS_SCOPE.to_string(),
+            ],
+        },
+    )
+    .await?;
+
+    // ── 2. Build resource maps ───────────────────────────────────────────────
     let mut workspaces = ResourceMap::new();
     workspaces.insert_labeled(
         "soc",
@@ -129,47 +162,73 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    // ── 3. Build and run pipeline ───────────────────────────────────────────
+    let mut defenders = ResourceMap::new();
+    defenders.insert_labeled(
+        "xdr",
+        DefenderXdr {
+            label: Some("xdr".into()),
+            client_id: client_id.clone(),
+            tenant_id: tenant_id.clone(),
+        },
+    );
+
+    // ── 3. Build and run pipeline ────────────────────────────────────────────
     let mut pipe = Pipeline::default();
 
     // Extensions
     pipe.extension(M365_AUTH_EXT, auth);
     pipe.extension("workspaces", workspaces);
+    pipe.extension("defender_xdr", defenders);
 
     // Variables
     pipe.var("workspace", "soc")?;
-    pipe.var("query", DATATABLE_QUERY)?;
+    pipe.var("sentinel_query", DATATABLE_QUERY)?;
+    pipe.var("tenant", "xdr")?;
+    pipe.var("hunting_query", HUNTING_QUERY)?;
 
-    // Step: run the datatable query
-    pipe.step::<RunQuery>(
-        "query",
+    // Step 1: Sentinel query against Log Analytics
+    pipe.step::<RunSentinelQuery>(
+        "sentinel",
         params!(
             "workspace" => Param::reference("workspace"),
-            "query" => Param::reference("query"),
+            "query" => Param::reference("sentinel_query"),
+        ),
+    )?;
+
+    // Step 2: Defender XDR Advanced Hunting query
+    pipe.step::<RunHuntingQuery>(
+        "hunting",
+        params!(
+            "tenant" => Param::reference("tenant"),
+            "query" => Param::reference("hunting_query"),
         ),
     )?;
 
     // Map step outputs to pipeline returns
     pipe.returns(
-        "query",
+        "sentinel",
         params!(
-            "result" => Param::reference("query.result"),
-            "row_count" => Param::reference("query.row_count"),
+            "result" => Param::reference("sentinel.result"),
+            "row_count" => Param::reference("sentinel.row_count"),
+        ),
+    )?;
+    pipe.returns(
+        "hunting",
+        params!(
+            "result" => Param::reference("hunting.result"),
+            "row_count" => Param::reference("hunting.row_count"),
         ),
     )?;
 
     println!("Running pipeline...");
     let complete = pipe.compile()?.run().wait()?;
 
-    // ── 4. Extract and deserialize results ──────────────────────────────────
-    let output: QueryOutput = complete.deserialize_returns("query")?;
+    // ── 4. Sentinel results ──────────────────────────────────────────────────
+    println!("\n=== Sentinel (Log Analytics) ===");
+    let sentinel_output: QueryOutput = complete.deserialize_returns("sentinel")?;
+    println!("Row count: {}", sentinel_output.row_count);
 
-    println!("Debug: {:#?}", output);
-
-    println!("\nRow count: {}", output.row_count);
-
-    // Parse the JSON result into the typed QueryResponse
-    let response: QueryResponse = serde_json::from_str(&output.result)?;
+    let response: QueryResponse = serde_json::from_str(&sentinel_output.result)?;
     let table = response
         .primary_table()
         .expect("Expected a primary result table");
@@ -179,7 +238,6 @@ async fn main() -> anyhow::Result<()> {
         table.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
     );
 
-    // Deserialize each row into a SignInEvent using column positions
     let events: Vec<SignInEvent> = table
         .rows
         .iter()
@@ -195,7 +253,6 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    // ── 5. Use the typed results ────────────────────────────────────────────
     println!(
         "\n{:<28} {:<25} {:<16} {:<6} {:<10} {}",
         "Timestamp", "User", "IP", "Loc", "Result", "Risk"
@@ -214,15 +271,41 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Filter: show only risky sign-ins
     let risky: Vec<&SignInEvent> = events.iter().filter(|e| e.risk_level != "none").collect();
-
     println!("\n--- Risky sign-ins: {} ---", risky.len());
     for event in risky {
         println!(
             "  {} from {} ({}) - risk: {}",
             event.user_principal_name, event.ip_address, event.location, event.risk_level
         );
+    }
+
+    // ── 5. Defender XDR results ──────────────────────────────────────────────
+    println!("\n=== Defender XDR (Advanced Hunting) ===");
+    let hunting_output: QueryOutput = complete.deserialize_returns("hunting")?;
+    println!("Row count: {}", hunting_output.row_count);
+
+    let hunting_response: HuntingResponse = serde_json::from_str(&hunting_output.result)?;
+    println!(
+        "Schema: {:?}",
+        hunting_response
+            .schema
+            .iter()
+            .map(|c| &c.name)
+            .collect::<Vec<_>>()
+    );
+
+    for row in &hunting_response.results {
+        let device = row
+            .get("DeviceName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let ip = row.get("RemoteIP").and_then(|v| v.as_str()).unwrap_or("?");
+        let count = row
+            .get("ConnectionCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        println!("  {:<30} {:<20} {} connections", device, ip, count);
     }
 
     Ok(())

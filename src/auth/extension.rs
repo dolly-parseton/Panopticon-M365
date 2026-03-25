@@ -1,4 +1,4 @@
-use super::{AuthScope, Session, SessionStore, AZURE_LOG_ANALYTICS_SCOPE, AZURE_MANAGEMENT_SCOPE};
+use super::{device_code_flow, AuthScope, SessionStore, TenantKey};
 use crate::resource::M365Resource;
 use panopticon_core::extend::{Extension, OperationError};
 use std::sync::{Arc, RwLock};
@@ -45,9 +45,14 @@ impl M365Auth {
         }))
     }
 
-    /// Start device code authentication for the given scope.
-    /// Returns a receiver that yields AuthEvents for the consumer to display.
-    /// The authentication completes when `AuthEvent::Authenticated` is received.
+    /// Start device code authentication for a client/tenant pair.
+    ///
+    /// Only one interactive auth is needed per (client_id, tenant_id) pair.
+    /// The resulting refresh token is used to silently acquire access tokens
+    /// for any resource scope within that tenant — no additional user interaction.
+    ///
+    /// `scope.scopes` should include `offline_access` plus at least one resource
+    /// scope for the initial token (e.g. `https://api.loganalytics.io/.default`).
     pub fn authenticate(&self, scope: AuthScope) -> mpsc::Receiver<AuthEvent> {
         let (tx, rx) = mpsc::channel(16);
         let http = self.http.clone();
@@ -55,14 +60,12 @@ impl M365Auth {
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
-            // Do the async device code flow without holding any locks.
-            let result = Session::init(&scope, &http, &tx).await;
+            let result = device_code_flow(&scope, &http, &tx).await;
 
             match result {
-                Ok(session) => {
-                    // Lock only briefly to insert the completed session.
+                Ok((key, session)) => {
                     let mut sessions = auth.sessions.write().unwrap();
-                    sessions.insert(scope, session);
+                    sessions.insert(key, session);
                 }
                 Err(e) => {
                     let _ = tx.send(AuthEvent::Error(e.to_string())).await;
@@ -73,76 +76,55 @@ impl M365Auth {
         rx
     }
 
-    /// Sync token retrieval for use inside pipeline operations.
-    /// Internally blocks on the tokio runtime for token refresh if needed.
-    pub fn token(&self, scope: &AuthScope) -> Result<String, OperationError> {
+    /// Get a token for a specific scope within an authenticated tenant.
+    ///
+    /// If the scope hasn't been used before, silently acquires a new access token
+    /// via refresh token exchange — no user interaction needed.
+    pub fn token(
+        &self,
+        client_id: &str,
+        tenant_id: &str,
+        scope: &str,
+    ) -> Result<String, OperationError> {
+        let key = TenantKey {
+            client_id: client_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+        };
+
         let mut sessions = self.sessions.write().map_err(|_| OperationError::Custom {
             operation: "M365Auth".into(),
             message: "Failed to acquire session lock".into(),
         })?;
 
         let http = &self.http;
-        self.runtime
-            .block_on(sessions.get_token(scope, http))
-            .ok_or_else(|| OperationError::Custom {
+        match self.runtime.block_on(sessions.get_token(&key, scope, http)) {
+            Some(Ok(token)) => Ok(token),
+            Some(Err(e)) => Err(OperationError::Custom {
+                operation: "M365Auth".into(),
+                message: format!("Failed to acquire token for scope '{}': {}", scope, e),
+            }),
+            None => Err(OperationError::Custom {
                 operation: "M365Auth".into(),
                 message: format!(
-                    "No authenticated session for scope (tenant: {}, client: {})",
-                    scope.tenant_id, scope.client_id
+                    "No authenticated session for tenant (client: {}, tenant: {}). \
+                     Call authenticate() first.",
+                    client_id, tenant_id
                 ),
-            })
+            }),
+        }
     }
 
-    pub fn token_for_management(
-        &self,
-        client_id: &str,
-        tenant_id: &str,
-    ) -> Result<String, OperationError> {
-        let scope = AuthScope {
-            client_id: client_id.to_string(),
-            tenant_id: tenant_id.to_string(),
-            scopes: vec![
-                "offline_access".to_string(),
-                AZURE_MANAGEMENT_SCOPE.to_string(),
-            ],
-        };
-        self.token(&scope)
-    }
-
-    pub fn token_for_log_analytics(
-        &self,
-        client_id: &str,
-        tenant_id: &str,
-    ) -> Result<String, OperationError> {
-        let scope = AuthScope {
-            client_id: client_id.to_string(),
-            tenant_id: tenant_id.to_string(),
-            scopes: vec![
-                "offline_access".to_string(),
-                AZURE_LOG_ANALYTICS_SCOPE.to_string(),
-            ],
-        };
-        self.token(&scope)
-    }
-
-    /// Get a token for a resource using its auth context and a specific scope.
-    /// Used by operations that resolve a resource from a `ResourceMap` extension.
+    /// Get a token for a resource using its auth context.
+    ///
+    /// Resolves the scope from the endpoint override or resource default,
+    /// then silently acquires the token via the tenant's refresh token.
     pub fn token_for_resource<R: M365Resource>(
         &self,
         resource: &R,
         scope_override: Option<&str>,
     ) -> Result<String, OperationError> {
-        let auth_scope = AuthScope {
-            client_id: resource.client_id().to_string(),
-            tenant_id: resource.tenant_id().to_string(),
-            scopes: vec![
-                "offline_access".to_string(),
-                scope_override
-                    .unwrap_or(R::default_scope())
-                    .to_string(),
-            ],
-        };
-        self.token(&auth_scope)
+        let scope = scope_override.unwrap_or(R::default_scope());
+        self.token(resource.client_id(), resource.tenant_id(), scope)
     }
 
     pub fn http_client(&self) -> &oauth2::reqwest::Client {
@@ -157,6 +139,7 @@ impl M365Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AZURE_LOG_ANALYTICS_SCOPE;
     use panopticon_core::extend::*;
     use panopticon_core::prelude::*;
     use std::any::TypeId;
@@ -206,7 +189,7 @@ mod tests {
             let client_id = context.input("client_id")?.get_value()?.as_text()?;
             let tenant_id = context.input("tenant_id")?.get_value()?.as_text()?;
 
-            let token = auth.token_for_log_analytics(client_id, tenant_id)?;
+            let token = auth.token(client_id, tenant_id, AZURE_LOG_ANALYTICS_SCOPE)?;
             println!("Token retrieved, length: {}", token.len());
 
             context.set_static_output(
@@ -239,7 +222,7 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let auth = M365Auth::new(http, runtime);
 
-        // 2. Authenticate via device code (before pipeline)
+        // 2. Authenticate via device code (before pipeline) — one interactive auth
         let scope = AuthScope {
             client_id: client_id.clone(),
             tenant_id: tenant_id.clone(),

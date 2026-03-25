@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod azure;
+pub mod defender;
 pub mod endpoint;
 pub mod operations;
 pub mod resource;

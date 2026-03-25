@@ -1,23 +1,23 @@
-use super::http::execute_endpoint;
 use crate::auth::{M365Auth, M365_AUTH_EXT};
 use crate::azure::log_analytics::{LogAnalyticsWorkspace, QueryEndpoint, QueryRequest};
+use crate::operations::http::execute_endpoint;
 use crate::resource::ResourceMap;
 use panopticon_core::extend::*;
 use panopticon_core::prelude::*;
 use std::any::TypeId;
 
-pub struct RunQuery;
+pub struct RunSentinelQuery;
 
 const WORKSPACES_EXT: &str = "workspaces";
 
-impl Operation for RunQuery {
+impl Operation for RunSentinelQuery {
     fn metadata() -> OperationMetadata
     where
         Self: Sized,
     {
         OperationMetadata {
-            name: "RunQuery",
-            description: "Executes a KQL query against a Log Analytics workspace",
+            name: "RunSentinelQuery",
+            description: "Executes a KQL query against a Sentinel Log Analytics workspace",
             inputs: &[
                 InputSpec {
                     name: "workspace",
@@ -99,7 +99,7 @@ impl Operation for RunQuery {
         };
 
         let response =
-            execute_endpoint::<QueryEndpoint>(auth, workspace, &request, "RunQuery")?;
+            execute_endpoint::<QueryEndpoint>(auth, workspace, &request, "RunSentinelQuery")?;
 
         // Serialize full response as JSON for downstream consumption.
         let json = serde_json::to_string(&response).map_err(|e| {

@@ -1,5 +1,7 @@
-mod http;
-mod run_query;
+pub mod defender;
+pub(crate) mod http;
+pub mod sentinel;
 
+pub use defender::hunting_query::RunHuntingQuery;
 pub use http::execute_endpoint;
-pub use run_query::RunQuery;
+pub use sentinel::sentinel_query::RunSentinelQuery;
